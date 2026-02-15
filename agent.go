@@ -1415,6 +1415,10 @@ func (a *Agent) handleInbound(msg *stun.Message, local Candidate, remote net.Add
 		if remoteCandidate, ok = a.handleInboundRequest(remoteCandidate, local, remote, msg); !ok {
 			return
 		}
+	case stun.ClassErrorResponse:
+		if !a.handleInboundErrorResponse(remoteCandidate, local, remote, msg) {
+			return
+		}
 	default:
 	}
 
@@ -1427,7 +1431,8 @@ func canHandleInbound(msg *stun.Message) bool {
 	return msg.Type.Method == stun.MethodBinding &&
 		(msg.Type.Class == stun.ClassSuccessResponse ||
 			msg.Type.Class == stun.ClassRequest ||
-			msg.Type.Class == stun.ClassIndication)
+			msg.Type.Class == stun.ClassIndication ||
+			msg.Type.Class == stun.ClassErrorResponse)
 }
 
 func (a *Agent) handleInboundResponse(
@@ -1511,6 +1516,62 @@ func (a *Agent) handleInboundRequest(
 	a.getSelector().HandleBindingRequest(msg, local, remoteCandidate)
 
 	return remoteCandidate, true
+}
+
+func (a *Agent) handleInboundErrorResponse(
+	remoteCandidate, local Candidate, remote net.Addr, msg *stun.Message,
+) bool {
+	a.log.Tracef("Inbound STUN (Error) from %s to %s", remote, local)
+
+	// Verify message integrity
+	if err := stun.MessageIntegrity([]byte(a.remotePwd)).Check(msg); err != nil {
+		a.log.Warnf("Discard error response with broken integrity from (%s), %v", remote, err)
+
+		return false
+	}
+
+	// Extract error code from the message
+	var errCode stun.ErrorCodeAttribute
+	if err := errCode.GetFrom(msg); err != nil {
+		a.log.Warnf("Failed to get error code from error response: %v", err)
+
+		return false
+	}
+
+	// Handle 487 Role Conflict error as per RFC 8445 section 7.3.1.1
+	if errCode.Code == stun.CodeRoleConflict {
+		a.log.Warnf("Received role conflict error (487) from %s, switching role", remote)
+
+		// Find the corresponding pending binding request
+		found, bindingReq, _ := a.handleInboundBindingSuccess(msg.TransactionID)
+		if !found {
+			a.log.Warnf("Received role conflict error for unknown transaction ID")
+
+			return false
+		}
+
+		// Switch our role
+		a.isControlling.Store(!a.isControlling.Load())
+		a.setSelector()
+
+		a.log.Infof("Switched ICE role to %s after receiving 487 error", a.role())
+
+		// Find the candidate pair to retry the connectivity check
+		if remoteCandidate != nil {
+			// Retry the binding request with the new role
+			a.getSelector().PingCandidate(local, remoteCandidate)
+			a.log.Debugf("Retrying connectivity check with new role from %s to %s", local, remoteCandidate)
+		} else {
+			a.log.Warnf("Cannot retry connectivity check, remote candidate not found for %s", bindingReq.destination)
+		}
+
+		return true
+	}
+
+	// Log other error codes but don't handle them
+	a.log.Debugf("Received STUN error response %d (%s) from %s", errCode.Code, errCode.Reason, remote)
+
+	return false
 }
 
 // validateNonSTUNTraffic processes non STUN traffic from a remote candidate,
