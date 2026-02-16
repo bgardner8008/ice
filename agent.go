@@ -1572,15 +1572,28 @@ func (a *Agent) handleInboundErrorResponse(
 
 		// Find the corresponding pending binding request
 		a.log.Infof("=== 487 HANDLER: Looking up transaction ID: %x ===", msg.TransactionID)
+		a.log.Infof("=== 487 HANDLER: Number of pending requests before lookup: %d ===", len(a.pendingBindingRequests))
 		found, bindingReq, _ := a.handleInboundBindingSuccess(msg.TransactionID)
 		if !found {
 			a.log.Warnf("=== 487 HANDLER: TRANSACTION ID NOT FOUND ===")
-			a.log.Warnf("This 487 error will be IGNORED - no matching pending request")
-			a.log.Warnf("Transaction ID: %x", msg.TransactionID)
+			a.log.Warnf("Possible reasons:")
+			a.log.Warnf("  1. Request already timed out and was removed")
+			a.log.Warnf("  2. Transaction ID mismatch")
+			a.log.Warnf("  3. This is a duplicate 487 error (already processed)")
+			a.log.Warnf("Transaction ID sought: %x", msg.TransactionID)
+			a.log.Warnf("Remaining pending requests: %d", len(a.pendingBindingRequests))
+			if len(a.pendingBindingRequests) > 0 {
+				a.log.Warnf("Pending transaction IDs:")
+				for i, req := range a.pendingBindingRequests {
+					a.log.Warnf("  [%d] %x -> %s (age: %v)", i, req.transactionID, req.destination, time.Since(req.timestamp))
+				}
+			}
+			a.log.Warnf("This 487 error will be IGNORED to prevent double-toggle")
 
 			return false
 		}
 		a.log.Infof("=== 487 HANDLER: Transaction ID FOUND, destination: %s ===", bindingReq.destination)
+		a.log.Infof("=== 487 HANDLER: Request age: %v ===", time.Since(bindingReq.timestamp))
 
 		// Store old role for logging
 		oldRole := a.role()
