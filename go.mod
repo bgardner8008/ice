@@ -1,4 +1,4 @@
-module github.com/pion/ice/v4
+module github.com/bgardner8008/ice/v4
 
 go 1.21
 
