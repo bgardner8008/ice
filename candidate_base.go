@@ -318,6 +318,15 @@ func (c *candidateBase) handleInboundPacket(buf []byte, srcAddr net.Addr) {
 			return
 		}
 
+		// Log all incoming STUN messages for debugging
+		agent.log.Tracef("STUN received on %s from %s: class=%s method=%s txID=%x", c.addr(), srcAddr, msg.Type.Class, msg.Type.Method, msg.TransactionID)
+
+		// Special logging for error responses
+		if msg.Type.Class == stun.ClassErrorResponse {
+			agent.log.Infof("=== ERROR RESPONSE RECEIVED at candidate_base === from %s on %s, method=%s, txID=%x", srcAddr, c.addr(), msg.Type.Method, msg.TransactionID)
+			agent.log.Infof("=== About to pass to handleInbound via loop.Run ===")
+		}
+
 		if err := agent.loop.Run(c, func(_ context.Context) {
 			// nolint: contextcheck
 			agent.handleInbound(msg, c, srcAddr)
