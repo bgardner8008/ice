@@ -1394,41 +1394,32 @@ func (a *Agent) handleRoleConflict(msg *stun.Message, local, remote Candidate, r
 // handleInbound processes STUN traffic from a remote candidate.
 func (a *Agent) handleInbound(msg *stun.Message, local Candidate, remote net.Addr) {
 	if msg == nil || local == nil {
-		a.log.Tracef("handleInbound: msg or local is nil, msg=%v local=%v", msg != nil, local != nil)
 		return
 	}
 
-	a.log.Tracef("handleInbound: from %s to %s class=%s method=%s", remote, local, msg.Type.Class, msg.Type.Method)
-
 	if !canHandleInbound(msg) {
-		a.log.Warnf("Unhandled STUN from %s to %s class(%s) method(%s) - canHandleInbound returned false", remote, local, msg.Type.Class, msg.Type.Method)
+		a.log.Tracef("Unhandled STUN from %s to %s class(%s) method(%s)", remote, local, msg.Type.Class, msg.Type.Method)
 
 		return
 	}
 
 	remoteCandidate := a.findRemoteCandidate(local.NetworkType(), remote)
-	a.log.Tracef("handleInbound: remoteCandidate found=%v for %s", remoteCandidate != nil, remote)
 
 	switch msg.Type.Class {
 	case stun.ClassSuccessResponse:
-		a.log.Tracef("handleInbound: routing to handleInboundResponse")
 		if !a.handleInboundResponse(remoteCandidate, local, remote, msg) {
 			return
 		}
 	case stun.ClassRequest:
-		a.log.Tracef("handleInbound: routing to handleInboundRequest")
 		var ok bool
 		if remoteCandidate, ok = a.handleInboundRequest(remoteCandidate, local, remote, msg); !ok {
 			return
 		}
 	case stun.ClassErrorResponse:
-		a.log.Infof("handleInbound: routing ERROR RESPONSE to handleInboundErrorResponse from %s", remote)
 		if !a.handleInboundErrorResponse(remoteCandidate, local, remote, msg) {
-			a.log.Warnf("handleInbound: handleInboundErrorResponse returned false for error from %s", remote)
 			return
 		}
 	default:
-		a.log.Warnf("handleInbound: unhandled message class %s from %s", msg.Type.Class, remote)
 	}
 
 	if remoteCandidate != nil {
@@ -1437,19 +1428,11 @@ func (a *Agent) handleInbound(msg *stun.Message, local Candidate, remote net.Add
 }
 
 func canHandleInbound(msg *stun.Message) bool {
-	canHandle := msg.Type.Method == stun.MethodBinding &&
+	return msg.Type.Method == stun.MethodBinding &&
 		(msg.Type.Class == stun.ClassSuccessResponse ||
 			msg.Type.Class == stun.ClassRequest ||
 			msg.Type.Class == stun.ClassIndication ||
 			msg.Type.Class == stun.ClassErrorResponse)
-
-	// Log when we reject error responses for debugging
-	if !canHandle && msg.Type.Class == stun.ClassErrorResponse {
-		// This should never happen now, but log if it does
-		return false
-	}
-
-	return canHandle
 }
 
 func (a *Agent) handleInboundResponse(
@@ -1538,88 +1521,55 @@ func (a *Agent) handleInboundRequest(
 func (a *Agent) handleInboundErrorResponse(
 	remoteCandidate, local Candidate, remote net.Addr, msg *stun.Message,
 ) bool {
-	a.log.Infof("=== handleInboundErrorResponse: START === from %s to %s", remote, local)
-	a.log.Infof("Current role: %s, remotePwd configured: %v", a.role(), a.remotePwd != "")
+	a.log.Tracef("Inbound STUN (Error) from %s to %s", remote, local)
 
 	// Verify message integrity
 	if err := stun.MessageIntegrity([]byte(a.remotePwd)).Check(msg); err != nil {
-		a.log.Warnf("=== 487 HANDLER: INTEGRITY CHECK FAILED === from %s: %v", remote, err)
-		a.log.Warnf("This error response will be IGNORED due to integrity failure")
+		a.log.Warnf("Discard error response with broken integrity from (%s), %v", remote, err)
 
 		return false
 	}
-	a.log.Infof("=== 487 HANDLER: Integrity check PASSED ===")
 
 	// Extract error code from the message
 	var errCode stun.ErrorCodeAttribute
 	if err := errCode.GetFrom(msg); err != nil {
-		a.log.Warnf("=== 487 HANDLER: FAILED to extract error code === %v", err)
-		a.log.Warnf("This error response will be IGNORED - cannot read error code")
+		a.log.Warnf("Failed to get error code from error response: %v", err)
 
 		return false
 	}
-	a.log.Infof("=== 487 HANDLER: Error code extracted: %d (%s) ===", errCode.Code, errCode.Reason)
 
 	// Handle 487 Role Conflict error as per RFC 8445 section 7.3.1.1
 	if errCode.Code == stun.CodeRoleConflict {
-		a.log.Warnf("=== 487 ROLE CONFLICT DETECTED === from %s", remote)
-		a.log.Warnf("=== Current role: %s, will switch to: %s ===", a.role(), func() Role {
-			if a.isControlling.Load() {
-				return Controlled
-			}
-			return Controlling
-		}())
+		a.log.Debugf("Received role conflict error (487) from %s, switching role", remote)
 
 		// Find the corresponding pending binding request
-		a.log.Infof("=== 487 HANDLER: Looking up transaction ID: %x ===", msg.TransactionID)
-		a.log.Infof("=== 487 HANDLER: Number of pending requests before lookup: %d ===", len(a.pendingBindingRequests))
 		found, bindingReq, _ := a.handleInboundBindingSuccess(msg.TransactionID)
 		if !found {
-			a.log.Warnf("=== 487 HANDLER: TRANSACTION ID NOT FOUND ===")
-			a.log.Warnf("Possible reasons:")
-			a.log.Warnf("  1. Request already timed out and was removed")
-			a.log.Warnf("  2. Transaction ID mismatch")
-			a.log.Warnf("  3. This is a duplicate 487 error (already processed)")
-			a.log.Warnf("Transaction ID sought: %x", msg.TransactionID)
-			a.log.Warnf("Remaining pending requests: %d", len(a.pendingBindingRequests))
-			if len(a.pendingBindingRequests) > 0 {
-				a.log.Warnf("Pending transaction IDs:")
-				for i, req := range a.pendingBindingRequests {
-					a.log.Warnf("  [%d] %x -> %s (age: %v)", i, req.transactionID, req.destination, time.Since(req.timestamp))
-				}
-			}
-			a.log.Warnf("This 487 error will be IGNORED to prevent double-toggle")
+			a.log.Debugf("Received role conflict error for unknown transaction ID, ignoring")
 
 			return false
 		}
-		a.log.Infof("=== 487 HANDLER: Transaction ID FOUND, destination: %s ===", bindingReq.destination)
-		a.log.Infof("=== 487 HANDLER: Request age: %v ===", time.Since(bindingReq.timestamp))
-
-		// Store old role for logging
-		oldRole := a.role()
 
 		// Switch our role
+		oldRole := a.role()
 		a.isControlling.Store(!a.isControlling.Load())
 		a.setSelector()
 
-		a.log.Warnf("=== 487 HANDLER: ROLE SWITCHED === %s → %s", oldRole, a.role())
+		a.log.Debugf("Switched ICE role %s → %s after receiving 487 error", oldRole, a.role())
 
 		// Find the candidate pair to retry the connectivity check
 		if remoteCandidate != nil {
 			// Retry the binding request with the new role
 			a.getSelector().PingCandidate(local, remoteCandidate)
-			a.log.Warnf("=== 487 HANDLER: RETRYING connectivity check === from %s to %s with new role %s", local, remoteCandidate, a.role())
 		} else {
-			a.log.Warnf("=== 487 HANDLER: CANNOT RETRY === remote candidate not found for %s", bindingReq.destination)
-			a.log.Warnf("Will retry on next scheduled connectivity check")
+			a.log.Warnf("Cannot retry connectivity check, remote candidate not found for %s", bindingReq.destination)
 		}
 
-		a.log.Infof("=== 487 HANDLER: SUCCESS === Role conflict handled")
 		return true
 	}
 
 	// Log other error codes but don't handle them
-	a.log.Infof("=== handleInboundErrorResponse: Non-487 error === code %d (%s) from %s", errCode.Code, errCode.Reason, remote)
+	a.log.Debugf("Received STUN error response %d (%s) from %s", errCode.Code, errCode.Reason, remote)
 
 	return false
 }
