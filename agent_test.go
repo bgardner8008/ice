@@ -2294,9 +2294,9 @@ func TestRoleConflictErrorResponse(t *testing.T) {
 	connDone := make(chan struct{})
 	go func() {
 		defer close(connDone)
-		_, err := aAgent.Dial(context.TODO(), ufragB, pwdB)
-		if err != nil {
-			t.Logf("Dial error (expected): %v", err)
+		_, dialErr := aAgent.Dial(context.TODO(), ufragB, pwdB)
+		if dialErr != nil {
+			t.Logf("Dial error (expected): %v", dialErr)
 		}
 	}()
 
@@ -2339,11 +2339,11 @@ func TestRoleConflictErrorResponse(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	// Inject the error response
-	aAgent.handleInbound(errorMsg, localCand, destAddr)
-
-	// Wait a bit for processing
-	time.Sleep(200 * time.Millisecond)
+	// Inject the error response through the agent's event loop to avoid data races
+	err = aAgent.loop.Run(context.Background(), func(_ context.Context) {
+		aAgent.handleInbound(errorMsg, localCand, destAddr)
+	})
+	require.NoError(t, err)
 
 	// Verify role switched
 	newRole := aAgent.isControlling.Load()

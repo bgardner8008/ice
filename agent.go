@@ -1410,20 +1410,20 @@ func (a *Agent) handleInbound(msg *stun.Message, local Candidate, remote net.Add
 		if !a.handleInboundResponse(remoteCandidate, local, remote, msg) {
 			return
 		}
+
+		remoteCandidate.seen(false)
 	case stun.ClassRequest:
 		var ok bool
 		if remoteCandidate, ok = a.handleInboundRequest(remoteCandidate, local, remote, msg); !ok {
 			return
 		}
-	case stun.ClassErrorResponse:
-		if !a.handleInboundErrorResponse(remoteCandidate, local, remote, msg) {
-			return
-		}
-	default:
-	}
 
-	if remoteCandidate != nil {
 		remoteCandidate.seen(false)
+	case stun.ClassErrorResponse:
+		a.handleInboundErrorResponse(remoteCandidate, local, remote, msg)
+
+		return
+	default:
 	}
 }
 
@@ -1538,7 +1538,7 @@ func (a *Agent) handleInboundErrorResponse(
 		return false
 	}
 
-	// Handle 487 Role Conflict error as per RFC 8445 section 7.3.1.1
+	// Handle 487 Role Conflict error as per RFC 8445 section 7.2.5.1
 	if errCode.Code == stun.CodeRoleConflict {
 		a.log.Debugf("Received role conflict error (487) from %s, switching role", remote)
 
@@ -1550,19 +1550,20 @@ func (a *Agent) handleInboundErrorResponse(
 			return false
 		}
 
-		// Switch our role
+		// Switch our role and regenerate tiebreaker
 		oldRole := a.role()
 		a.isControlling.Store(!a.isControlling.Load())
+		a.tieBreaker = globalMathRandomGenerator.Uint64()
 		a.setSelector()
 
 		a.log.Debugf("Switched ICE role %s → %s after receiving 487 error", oldRole, a.role())
 
-		// Find the candidate pair to retry the connectivity check
-		if remoteCandidate != nil {
-			// Retry the binding request with the new role
-			a.getSelector().PingCandidate(local, remoteCandidate)
+		// Re-enqueue the candidate pair in the triggered-check queue
+		if pair := a.findPair(local, remoteCandidate); pair != nil {
+			pair.state = CandidatePairStateWaiting
+			pair.bindingRequestCount = 0
 		} else {
-			a.log.Warnf("Cannot retry connectivity check, remote candidate not found for %s", bindingReq.destination)
+			a.log.Warnf("Cannot re-enqueue candidate pair for %s, not found in checklist", bindingReq.destination)
 		}
 
 		return true
